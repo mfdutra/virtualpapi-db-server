@@ -1,0 +1,18 @@
+[package]
+name = "virtualpapi-db-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+totp-rs = { version = "5.6", features = ["gen_secret"] }
+serde = { version = "1.0", features = ["derive"] }
+tower-http = { version = "0.5", features = ["fs"] }
+tokio-util = { version = "0.7", features = ["io"] }
+clap = { version = "4.5", features = ["derive"] }
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3.0"
