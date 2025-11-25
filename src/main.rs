@@ -1,7 +1,7 @@
 use axum::{
     Router,
     extract::{Query, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -43,10 +43,61 @@ struct TotpQuery {
 async fn update_aviation_db(
     State(config): State<Arc<AppConfig>>,
     Query(params): Query<TotpQuery>,
+    headers: HeaderMap,
 ) -> Response {
     // Verify TOTP
     if !verify_totp(&params.totp, &config.totp_secret) {
         return (StatusCode::UNAUTHORIZED, "Invalid TOTP").into_response();
+    }
+
+    // Get file metadata to generate ETag
+    let metadata = match fs::metadata(&config.db_file).await {
+        Ok(meta) => meta,
+        Err(e) => {
+            eprintln!("Error getting metadata for {}: {}", config.db_file, e);
+            return (StatusCode::NOT_FOUND, "Database file not found").into_response();
+        }
+    };
+
+    let file_size = metadata.len();
+
+    // Generate ETag from file size and modification time
+    let etag = match metadata.modified() {
+        Ok(mtime) => {
+            let duration = mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            format!(
+                "\"{}-{}-{}\"",
+                file_size,
+                duration.as_secs(),
+                duration.subsec_nanos()
+            )
+        }
+        Err(e) => {
+            eprintln!("Error getting modification time: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error processing file metadata",
+            )
+                .into_response();
+        }
+    };
+
+    // Check If-None-Match header
+    if let Some(if_none_match) = headers.get(header::IF_NONE_MATCH) {
+        if let Ok(if_none_match_str) = if_none_match.to_str() {
+            // Check if the ETag matches (supporting both single ETag and comma-separated list)
+            if if_none_match_str == "*"
+                || if_none_match_str.split(',').any(|tag| tag.trim() == etag)
+            {
+                return Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header(header::ETAG, etag)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+            }
+        }
     }
 
     // Serve the aviation.db file
@@ -62,6 +113,8 @@ async fn update_aviation_db(
                     header::CONTENT_DISPOSITION,
                     "attachment; filename=\"aviation.db\"",
                 )
+                .header(header::CONTENT_LENGTH, file_size)
+                .header(header::ETAG, etag)
                 .body(body)
                 .unwrap()
         }
@@ -386,5 +439,206 @@ mod tests {
         // Check Content-Disposition header
         let content_disposition = response.headers().get("content-disposition").unwrap();
         assert_eq!(content_disposition, "attachment; filename=\"aviation.db\"");
+    }
+
+    #[tokio::test]
+    async fn test_etag_header_present() {
+        // Create a temporary database file
+        let mut temp_db = NamedTempFile::new().unwrap();
+        temp_db.write_all(b"test content").unwrap();
+        temp_db.flush().unwrap();
+
+        let db_path = temp_db.path().to_str().unwrap().to_string();
+        let token = generate_test_totp(TEST_SECRET);
+
+        // Create app config
+        let config = Arc::new(AppConfig {
+            totp_secret: TEST_SECRET.to_string(),
+            db_file: db_path,
+        });
+
+        // Build the app
+        let app = Router::new()
+            .route("/update-aviation-db", get(update_aviation_db))
+            .with_state(config);
+
+        // Make request
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/update-aviation-db?totp={}", token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Check ETag header is present
+        let etag = response.headers().get("etag");
+        assert!(etag.is_some(), "ETag header should be present");
+
+        // Verify ETag format (should be quoted and contain size and timestamp)
+        let etag_value = etag.unwrap().to_str().unwrap();
+        assert!(etag_value.starts_with('"') && etag_value.ends_with('"'));
+        assert!(etag_value.contains('-')); // Should contain hyphens separating size and time
+    }
+
+    #[tokio::test]
+    async fn test_etag_not_modified() {
+        // Create a temporary database file
+        let mut temp_db = NamedTempFile::new().unwrap();
+        temp_db.write_all(b"test content").unwrap();
+        temp_db.flush().unwrap();
+
+        let db_path = temp_db.path().to_str().unwrap().to_string();
+        let token = generate_test_totp(TEST_SECRET);
+
+        // Create app config
+        let config = Arc::new(AppConfig {
+            totp_secret: TEST_SECRET.to_string(),
+            db_file: db_path,
+        });
+
+        // Build the app
+        let app = Router::new()
+            .route("/update-aviation-db", get(update_aviation_db))
+            .with_state(config.clone());
+
+        // First request to get the ETag
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/update-aviation-db?totp={}", token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = response.headers().get("etag").unwrap().to_str().unwrap();
+
+        // Generate a new token for the second request
+        let token2 = generate_test_totp(TEST_SECRET);
+
+        // Second request with If-None-Match header
+        let app2 = Router::new()
+            .route("/update-aviation-db", get(update_aviation_db))
+            .with_state(config);
+
+        let response2 = app2
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/update-aviation-db?totp={}", token2))
+                    .header("If-None-Match", etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Should return 304 Not Modified
+        assert_eq!(response2.status(), StatusCode::NOT_MODIFIED);
+
+        // ETag should still be present in 304 response
+        let etag2 = response2.headers().get("etag").unwrap().to_str().unwrap();
+        assert_eq!(etag, etag2);
+
+        // Body should be empty for 304 response
+        let body = response2.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_etag_mismatch_serves_file() {
+        // Create a temporary database file
+        let mut temp_db = NamedTempFile::new().unwrap();
+        temp_db.write_all(b"test content").unwrap();
+        temp_db.flush().unwrap();
+
+        let db_path = temp_db.path().to_str().unwrap().to_string();
+        let token = generate_test_totp(TEST_SECRET);
+
+        // Create app config
+        let config = Arc::new(AppConfig {
+            totp_secret: TEST_SECRET.to_string(),
+            db_file: db_path,
+        });
+
+        // Build the app
+        let app = Router::new()
+            .route("/update-aviation-db", get(update_aviation_db))
+            .with_state(config);
+
+        // Make request with a mismatched If-None-Match header
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/update-aviation-db?totp={}", token))
+                    .header("If-None-Match", "\"wrong-etag\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Should return 200 OK and serve the file
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify content is served
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"test content");
+    }
+
+    #[tokio::test]
+    async fn test_content_length_header() {
+        // Create a temporary database file with known content
+        let mut temp_db = NamedTempFile::new().unwrap();
+        let test_content = b"test content with specific length";
+        temp_db.write_all(test_content).unwrap();
+        temp_db.flush().unwrap();
+
+        let db_path = temp_db.path().to_str().unwrap().to_string();
+        let token = generate_test_totp(TEST_SECRET);
+
+        // Create app config
+        let config = Arc::new(AppConfig {
+            totp_secret: TEST_SECRET.to_string(),
+            db_file: db_path,
+        });
+
+        // Build the app
+        let app = Router::new()
+            .route("/update-aviation-db", get(update_aviation_db))
+            .with_state(config);
+
+        // Make request
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/update-aviation-db?totp={}", token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Check Content-Length header is present and correct
+        let content_length = response.headers().get("content-length");
+        assert!(
+            content_length.is_some(),
+            "Content-Length header should be present"
+        );
+
+        let content_length_value = content_length.unwrap().to_str().unwrap();
+        assert_eq!(
+            content_length_value,
+            test_content.len().to_string(),
+            "Content-Length should match file size"
+        );
     }
 }
